@@ -9,20 +9,69 @@
 """Test for openers module"""
 
 import contextlib
+import gzip
 import hashlib
 import os
+import struct
 import time
 import unittest
 from gzip import GzipFile
 from io import BytesIO, UnsupportedOperation
 from unittest import mock
 
+import numpy as np
 import pytest
 from packaging.version import Version
 
-from .._compression import HAVE_INDEXED_GZIP, HAVE_ZSTD, DeterministicGzipFile, zstd
+from .. import Nifti1Image
+from .._compression import (
+    HAVE_INDEXED_GZIP,
+    HAVE_ISAL,
+    HAVE_ZSTD,
+    ISAL_COMPRESSLEVELS,
+    DeterministicGzipFile,
+    zstd,
+)
 from ..openers import BZ2File, ImageOpener, Opener
 from ..tmpdirs import InTemporaryDirectory
+
+if HAVE_ISAL:
+    from isal.igzip import IGzipFile
+
+    from .._compression import DeterministicIGzipFile
+else:
+    IGzipFile = DeterministicIGzipFile = None  # type: ignore[misc,assignment]
+
+#: gzip writers to test: zlib (stdlib) always, ISA-L when installed
+GZIP_BACKENDS = [
+    'zlib',
+    pytest.param('isal', marks=pytest.mark.skipif(not HAVE_ISAL, reason='isal not installed')),
+]
+
+
+@pytest.fixture(params=GZIP_BACKENDS)
+def gzip_backend(request):
+    """Select the gzip writer by toggling the ISA-L switch"""
+    with mock.patch('nibabel._compression.USE_ISAL', request.param == 'isal'):
+        yield request.param
+
+
+def reference_gzip(msg, backend, compresslevel=1, mtime=0):
+    """Compress ``msg`` directly with ``backend``, with no filename in the header"""
+    writer = IGzipFile if backend == 'isal' else GzipFile
+    bio = BytesIO()
+    with writer(
+        filename='', mode='wb', compresslevel=compresslevel, fileobj=bio, mtime=mtime
+    ) as gz:
+        gz.write(msg)
+    return bio.getvalue()
+
+
+def gzip_header_fields(data):
+    """Return the (FLG, MTIME) fields of a gzip header"""
+    # RFC 1952: ID1 ID2 CM FLG MTIME(4) XFL OS
+    assert data[:3] == b'\x1f\x8b\x08'
+    return data[3], struct.unpack('<I', data[4:8])[0]
 
 
 class Lunk:
@@ -452,14 +501,14 @@ def test_DeterministicGzipFile_fileobj():
         assert md5sum('test.gz') == ref_chksum
 
 
-def test_bitwise_determinism():
+@pytest.mark.thread_unsafe
+def test_bitwise_determinism(gzip_backend):
     with InTemporaryDirectory():
         msg = b"Hello, I'd like to have an argument."
         # Canonical reference: No filename, no mtime
         # Use default compresslevel
         with open('ref.gz', 'wb') as fobj:
-            with GzipFile(filename='', mode='wb', compresslevel=1, fileobj=fobj, mtime=0) as gzobj:
-                gzobj.write(msg)
+            fobj.write(reference_gzip(msg, gzip_backend, compresslevel=1, mtime=0))
         anon_chksum = md5sum('ref.gz')
 
         # Different times, different filenames
@@ -483,3 +532,137 @@ def test_bitwise_determinism():
         fnameA_chksum = md5sum('filenameA.gz')
         fnameB_chksum = md5sum('filenameB.gz')
         assert fnameA_chksum == fnameB_chksum != anon_chksum
+
+
+@pytest.mark.thread_unsafe
+def test_Opener_gzip_backend(tmp_path, gzip_backend):
+    # Opener writes with ISA-L when installed and enabled, zlib otherwise;
+    # either way the output is a plain gzip stream with a deterministic header
+    msg = bytes(range(256)) * 64 + b'Still crazy after all these years. ' * 500
+    fname = tmp_path / 'test.gz'
+
+    with Opener(fname, 'wb') as fobj:
+        if gzip_backend == 'isal':
+            assert isinstance(fobj.fobj, DeterministicIGzipFile)
+            assert isinstance(fobj.fobj, IGzipFile)
+        else:
+            assert isinstance(fobj.fobj, DeterministicGzipFile)
+            assert not (HAVE_ISAL and isinstance(fobj.fobj, IGzipFile))
+        # Either way, it is a GzipFile
+        assert isinstance(fobj.fobj, GzipFile)
+        fobj.write(msg)
+
+    data = fname.read_bytes()
+    # Readable by the standard library, and by our reader
+    with gzip.open(fname, 'rb') as fobj:
+        assert fobj.read() == msg
+    with Opener(fname, 'rb') as fobj:
+        assert fobj.read() == msg
+    # No filename (FNAME flag) and no mtime in the header
+    flags, mtime = gzip_header_fields(data)
+    assert flags & 0x08 == 0
+    assert mtime == 0
+    # Byte-identical to the backend's own writer with the same settings
+    assert data == reference_gzip(msg, gzip_backend, compresslevel=1, mtime=0)
+
+    # An explicit mtime is honoured, and nothing else changes
+    with Opener(fname, 'wb', mtime=0xCAFE10C0) as fobj:
+        fobj.write(msg)
+    data = fname.read_bytes()
+    flags, mtime = gzip_header_fields(data)
+    assert flags & 0x08 == 0
+    assert mtime == 0xCAFE10C0
+    assert data == reference_gzip(msg, gzip_backend, compresslevel=1, mtime=0xCAFE10C0)
+    with gzip.open(fname, 'rb') as fobj:
+        assert fobj.read() == msg
+
+
+@pytest.mark.thread_unsafe
+@pytest.mark.parametrize('compresslevel', range(10))
+def test_Opener_gzip_backend_levels(tmp_path, gzip_backend, compresslevel):
+    # ISA-L only implements levels 0-3, and its level 0 is not "stored" as
+    # in zlib, so only levels 1-3 go to ISA-L; the rest fall back to zlib
+    msg = b'Well, you can sit there, or you can go. ' * 1000
+    fname = tmp_path / 'test.gz'
+    with Opener(fname, 'wb', compresslevel=compresslevel) as fobj:
+        if gzip_backend == 'isal' and compresslevel in ISAL_COMPRESSLEVELS:
+            assert isinstance(fobj.fobj, DeterministicIGzipFile)
+        else:
+            assert isinstance(fobj.fobj, DeterministicGzipFile)
+        fobj.write(msg)
+    with gzip.open(fname, 'rb') as fobj:
+        assert fobj.read() == msg
+    assert fname.read_bytes() == reference_gzip(
+        msg,
+        gzip_backend if compresslevel in ISAL_COMPRESSLEVELS else 'zlib',
+        compresslevel=compresslevel,
+    )
+
+
+@pytest.mark.thread_unsafe
+@pytest.mark.skipif(not HAVE_ISAL, reason='isal not installed')
+def test_isal_opt_out(tmp_path):
+    # With isal installed, USE_ISAL=False falls back to zlib exactly
+    msg = b'We want... a shrubbery! ' * 1000
+    fname = tmp_path / 'test.gz'
+    with Opener(fname, 'wb') as fobj:
+        assert isinstance(fobj.fobj, IGzipFile)
+        fobj.write(msg)
+    assert fname.read_bytes() == reference_gzip(msg, 'isal')
+
+    with mock.patch('nibabel._compression.USE_ISAL', False):
+        with Opener(fname, 'wb') as fobj:
+            assert isinstance(fobj.fobj, DeterministicGzipFile)
+            assert not isinstance(fobj.fobj, IGzipFile)
+            fobj.write(msg)
+    assert fname.read_bytes() == reference_gzip(msg, 'zlib')
+
+    # Pretending isal is not installed has the same effect
+    with mock.patch('nibabel._compression.HAVE_ISAL', False):
+        with Opener(fname, 'wb') as fobj:
+            assert isinstance(fobj.fobj, DeterministicGzipFile)
+            fobj.write(msg)
+    assert fname.read_bytes() == reference_gzip(msg, 'zlib')
+
+
+@pytest.mark.thread_unsafe
+def test_DeterministicIGzipFile(tmp_path):
+    if not HAVE_ISAL:
+        pytest.skip('isal not installed')
+    msg = b'Nobody expects the Spanish Inquisition! ' * 1000
+    fname = tmp_path / 'test.gz'
+    # Defaults: level 1, mtime 0, no filename in the header
+    with DeterministicIGzipFile(fname, 'wb') as fobj:
+        fobj.write(msg)
+    assert fname.read_bytes() == reference_gzip(msg, 'isal', compresslevel=1, mtime=0)
+    # Text-ish mode is mapped to binary, as for DeterministicGzipFile
+    with DeterministicIGzipFile(fname, 'w', compresslevel=3) as fobj:
+        fobj.write(msg)
+    assert fname.read_bytes() == reference_gzip(msg, 'isal', compresslevel=3, mtime=0)
+    # fileobj is accepted, and the filename is still not embedded
+    with open(fname, 'wb') as fobj:
+        with DeterministicIGzipFile(filename='test.gz', mode='wb', fileobj=fobj) as gzobj:
+            gzobj.write(msg)
+    assert fname.read_bytes() == reference_gzip(msg, 'isal')
+    # Levels ISA-L does not implement are rejected, not silently clamped
+    with pytest.raises(ValueError):
+        DeterministicIGzipFile(fname, 'wb', compresslevel=4)
+    with pytest.raises(TypeError):
+        DeterministicIGzipFile(mode='wb')
+
+
+@pytest.mark.thread_unsafe
+def test_image_roundtrip_gzip_backend(tmp_path, gzip_backend):
+    # Save a NIfTI image with one writer and read it back with every reader
+    rng = np.random.default_rng(20261104)
+    data = rng.standard_normal((8, 9, 10, 3)).astype(np.float32)
+    img = Nifti1Image(data, np.eye(4))
+    fname = tmp_path / 'test.nii.gz'
+    img.to_filename(fname)
+    with gzip.open(fname, 'rb') as fobj:
+        raw = fobj.read()
+    assert raw[:4] == b'\x5c\x01\x00\x00'  # sizeof_hdr == 348
+    for use_isal in (True, False):
+        with mock.patch('nibabel._compression.USE_ISAL', use_isal):
+            rt = Nifti1Image.from_filename(fname)
+            assert np.array_equal(np.asanyarray(rt.dataobj), data)

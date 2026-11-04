@@ -90,6 +90,7 @@ Requirements
 *  SciPy_ 1.11 or greater (optional, for full SPM-ANALYZE support)
 *  h5py_ 3.8 or greater (optional, for MINC2 support)
 *  PyDICOM_ 2.3.0 or greater (optional, for DICOM support)
+*  isal_ 1.1 or greater (optional, for faster writing of gzipped files)
 *  `Python Imaging Library`_ 8.4 or greater (optional, for PNG conversion in DICOMFS)
 *  pytest_ (optional, to run the tests)
 *  sphinx_ (optional, to build the documentation)

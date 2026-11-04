@@ -27,6 +27,7 @@ from .optpkg import optional_package
 
 if ty.TYPE_CHECKING:
     import indexed_gzip  # type: ignore[import]
+    from isal import igzip as isal_igzip
 
     if not HAVE_ZSTD:  # PY313
         from backports import zstd  # type: ignore[import]
@@ -34,6 +35,7 @@ if ty.TYPE_CHECKING:
         HAVE_ZSTD = True
 
     HAVE_INDEXED_GZIP = True
+    HAVE_ISAL = True
     HAVE_ZSTD = True
 
     ModeRT = ty.Literal['r', 'rt']
@@ -46,6 +48,7 @@ if ty.TYPE_CHECKING:
 
 else:
     indexed_gzip, HAVE_INDEXED_GZIP, _ = optional_package('indexed_gzip')
+    isal_igzip, HAVE_ISAL, _ = optional_package('isal.igzip')
     if not HAVE_ZSTD:  # PY313
         zstd, HAVE_ZSTD, _ = optional_package('backports.zstd')
 
@@ -70,6 +73,54 @@ if HAVE_ZSTD:
     COMPRESSED_FILE_LIKES += (zstd.ZstdFile,)
     COMPRESSION_ERRORS += (zstd.ZstdError,)
 
+#: Write gzip files with ISA-L (the ``isal`` package) when it is installed.
+#:
+#: ISA-L produces standard gzip streams several times faster than zlib.
+#: Set to ``False`` to always write with the standard library :mod:`gzip`
+#: module, for example to get byte-identical output to an older setup::
+#:
+#:     import nibabel
+#:     nibabel._compression.USE_ISAL = False
+#:
+#: This has no effect when ``isal`` is not installed (see :data:`HAVE_ISAL`).
+USE_ISAL: bool = True
+
+#: Compression levels that are handed to ISA-L.
+#:
+#: ISA-L only implements levels 0-3, and its level 0 still compresses, unlike
+#: zlib's level 0, which stores the data uncompressed. To keep the meaning of
+#: ``compresslevel`` unchanged, level 0 and levels 4-9 are written with the
+#: standard library :mod:`gzip` module.
+ISAL_COMPRESSLEVELS: range = range(1, 4)
+
+
+def _isal_for_level(compresslevel: int | None) -> bool:
+    """True if ISA-L is installed, enabled, and implements ``compresslevel``"""
+    return HAVE_ISAL and USE_ISAL and compresslevel in ISAL_COMPRESSLEVELS
+
+
+def _normalize_gzip_args(
+    filename: str | None,
+    mode: Mode | None,
+    fileobj: io.FileIO | None,
+) -> tuple[str, io.FileIO, io.FileIO | None]:
+    """Return a binary mode string, a file object, and the file object we opened (if any)"""
+    if mode is None:
+        mode = 'rb'
+    modestr: str = mode
+
+    # These two guards are adapted from
+    # https://github.com/python/cpython/blob/6ab65c6/Lib/gzip.py#L171-L174
+    if 'b' not in modestr:
+        modestr = f'{mode}b'
+    myfileobj = None
+    if fileobj is None:
+        if filename is None:
+            raise TypeError('Must define either fileobj or filename')
+        # Cast because GzipFile.myfileobj has type io.FileIO while open returns ty.IO
+        fileobj = myfileobj = ty.cast('io.FileIO', open(filename, modestr))
+    return modestr, fileobj, myfileobj
+
 
 class DeterministicGzipFile(gzip.GzipFile):
     """Deterministic variant of GzipFile
@@ -86,19 +137,9 @@ class DeterministicGzipFile(gzip.GzipFile):
         fileobj: io.FileIO | None = None,
         mtime: int = 0,
     ):
-        if mode is None:
-            mode = 'rb'
-        modestr: str = mode
-
-        # These two guards are adapted from
-        # https://github.com/python/cpython/blob/6ab65c6/Lib/gzip.py#L171-L174
-        if 'b' not in modestr:
-            modestr = f'{mode}b'
-        if fileobj is None:
-            if filename is None:
-                raise TypeError('Must define either fileobj or filename')
-            # Cast because GzipFile.myfileobj has type io.FileIO while open returns ty.IO
-            fileobj = self.myfileobj = ty.cast('io.FileIO', open(filename, modestr))
+        modestr, fileobj, myfileobj = _normalize_gzip_args(filename, mode, fileobj)
+        if myfileobj is not None:
+            self.myfileobj = myfileobj
         # Only forward compresslevel when explicitly set; None defers to Python's runtime default
         compress_kwargs: dict[str, int] = {}
         if compresslevel is not None:
@@ -110,6 +151,42 @@ class DeterministicGzipFile(gzip.GzipFile):
             mtime=mtime,
             **compress_kwargs,
         )
+
+
+if HAVE_ISAL:
+
+    class DeterministicIGzipFile(isal_igzip.IGzipFile):
+        """Deterministic variant of ``isal.igzip.IGzipFile``
+
+        This writer uses the ISA-L library to produce standard gzip streams.
+        Like :class:`DeterministicGzipFile`, it does not add filename information
+        to the header, and defaults to a modification time (``mtime``) of 0 seconds.
+
+        ISA-L only implements compression levels 0-3; ``compresslevel`` must be
+        one of these, and the default is 1 (the :class:`~nibabel.openers.Opener`
+        default). Open files for writing only.
+        """
+
+        def __init__(
+            self,
+            filename: str | None = None,
+            mode: Mode | None = None,
+            compresslevel: int | None = None,
+            fileobj: io.FileIO | None = None,
+            mtime: int = 0,
+        ):
+            if compresslevel is None:
+                compresslevel = 1
+            modestr, fileobj, myfileobj = _normalize_gzip_args(filename, mode, fileobj)
+            if myfileobj is not None:
+                self.myfileobj = myfileobj
+            super().__init__(
+                filename='',
+                mode=modestr,
+                compresslevel=compresslevel,
+                fileobj=fileobj,
+                mtime=mtime,
+            )
 
 
 def gzip_open(
@@ -124,8 +201,12 @@ def gzip_open(
     If opening a file for reading, and ``indexed_gzip`` is available,
     an ``IndexedGzipFile`` is returned.
 
-    Otherwise (opening for writing, or ``indexed_gzip`` not available),
-    a ``DeterministicGzipFile`` is returned.
+    If opening a file for writing, ``isal`` is available and enabled
+    (see :data:`USE_ISAL`), and ``compresslevel`` is one of
+    :data:`ISAL_COMPRESSLEVELS`, a ``DeterministicIGzipFile`` is returned,
+    which writes with the ISA-L library.
+
+    Otherwise, a ``DeterministicGzipFile`` is returned.
 
     Parameters:
     -----------
@@ -138,13 +219,18 @@ def gzip_open(
         Compression level when writing. If None, the running Python's default is used.
     mtime: int
         Modification time used when writing a file - passed to the
-        ``DetemrinisticGzipFile``. Ignored when reading.
+        ``DeterministicGzipFile``. Ignored when reading.
     keep_open: bool
         Whether to keep the file handle open between reads. Ignored when writing,
         or when ``indexed_gzip`` is not present.
     """
+    gzip_file: gzip.GzipFile
     if not HAVE_INDEXED_GZIP or mode != 'rb':
-        gzip_file = DeterministicGzipFile(filename, mode, compresslevel, mtime=mtime)
+        # use ISA-L for faster writes, when the level is one it implements
+        if 'w' in mode and _isal_for_level(compresslevel):
+            gzip_file = DeterministicIGzipFile(filename, mode, compresslevel, mtime=mtime)
+        else:
+            gzip_file = DeterministicGzipFile(filename, mode, compresslevel, mtime=mtime)
 
     # use indexed_gzip if possible for faster read access.  If keep_open ==
     # True, we tell IndexedGzipFile to keep the file handle open. Otherwise

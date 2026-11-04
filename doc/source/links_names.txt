@@ -112,6 +112,7 @@
 .. _datapkg: https://pythonhosted.org/datapkg/
 .. _python imaging library: https://pypi.python.org/pypi/Pillow
 .. _h5py: https://www.h5py.org/
+.. _isal: https://github.com/pycompression/python-isal
 .. _packaging: https://packaging.pypa.io
 .. _importlib-resources: https://importlib-resources.readthedocs.io/
 
